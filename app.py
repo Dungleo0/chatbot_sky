@@ -2,20 +2,22 @@ from fastapi import FastAPI
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from typing import List,Annotated, TypedDict
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage,AIMessage
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langgraph.graph import add_messages, StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 import sqlite3
 import os
+import uuid
 
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_pinecone import PineconeVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
 import pandas as pd
 from pinecone import Pinecone, ServerlessSpec
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
-
+import random
 
 
 load_dotenv()
@@ -29,7 +31,7 @@ GROQ_API_KEY = os.getenv("CHAT_INTENT")
 
 
 llm = ChatGroq(
-    model="llama3-70b-8192",
+    model="meta-llama/llama-4-scout-17b-16e-instruct",
     api_key=GROQ_API_KEY,
     temperature=0.1,
     max_tokens=None,
@@ -53,7 +55,7 @@ index = pc.Index(PINECONE_INDEX)
 HUGGINGFACEHUB_API_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
 embeddings = HuggingFaceEndpointEmbeddings(
-    model="BAAI/bge-m3",  # hoặc BAAI/bge-m3
+    model="BAAI/bge-m3", 
     huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN
 )
 
@@ -69,9 +71,12 @@ def chatbot(state):
     """Node xử lý trả lời từ LLM"""
     user_query = state["messages"][-1].content
 
-    return {
-        "messages": [HumanMessage(content=user_query)]
-    }
+    result = llm.invoke([HumanMessage(content=user_query)])
+
+    if isinstance(result, str):
+        result = AIMessage(content=result)
+
+    return {"messages": [result]}
 
 # Graph
 graph = StateGraph(BasicChatState)
@@ -93,7 +98,7 @@ def chat(request: ChatRequest):
     """Chat có kết hợp tìm kiếm Pinecone + dữ liệu CSV"""
 
     # 1. Tìm kiếm trong Pinecone
-    docs = vectorstore.similarity_search(request.user_input, k=3)
+    docs = vectorstore.similarity_search(request.user_input, k=7)
 
     context = ""
     if docs:
@@ -110,19 +115,18 @@ def chat(request: ChatRequest):
             context = context[:max_chars] + "... [cắt bớt]"
         
         query_with_context = f"""
+Nếu người dùng hỏi không liên quan đến cơ sở tri thức, hãy nói là chưa hỗ trợ chỉ có thể tư vấn về vấn đề trong cơ sở dữ liệu
 Người dùng hỏi: {request.user_input}
 
 Dữ liệu liên quan từ cơ sở tri thức:
 {context}
 
 Hãy trả lời ngắn gọn, rõ ràng dựa trên dữ liệu trên.
-Nếu dữ liệu chưa đủ, hãy trả lời tự nhiên.
 """
     else:
         # Nếu không tìm thấy dữ liệu → hỏi trực tiếp LLM
         query_with_context = request.user_input
 
-    # 2. Gửi vào LangGraph (chỉ gửi 1 HumanMessage)
     result = app_graph.invoke({
         "messages": [HumanMessage(content=query_with_context)]
     }, config=config)
@@ -132,42 +136,89 @@ Nếu dữ liệu chưa đủ, hãy trả lời tự nhiên.
         "sources": [d.metadata for d in docs] if docs else []
     }
 
-
-
 @app.post("/upload_csv")
 async def upload_csv(file: UploadFile = File(...)):
-    """Upload file CSV và lưu dữ liệu vào Pinecone"""
+    """Upload file CSV, chuẩn hóa dữ liệu, chunk và lưu vào Pinecone"""
+
+    # Kiểm tra định dạng
     if not file.filename.endswith(".csv"):
         return {"error": "Chỉ hỗ trợ file CSV"}
 
-    df = pd.read_csv(file.file)
+    # Đọc CSV an toàn
+    try:
+        df = pd.read_csv(file.file).fillna("")
+    except Exception as e:
+        return {"error": f"Lỗi đọc CSV: {str(e)}"}
 
-    # Thay thế NaN/null bằng chuỗi rỗng
-    df = df.fillna("")
+    # Nếu có nhiều dòng trùng id_product -> lấy bản ghi đầu tiên
+    if "id_product" in df.columns:
+        df = df.groupby("id_product", as_index=False).first()
 
-    # Chuyển từng dòng thành text
-    texts = df.astype(str).apply(lambda row: " | ".join(row.values), axis=1).tolist()
+    # Text splitter để chunk
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50,
+        length_function=len,
+        separators=["\n\n", "\n", ".", ";", " "]
+    )
 
-    # Tạo id và metadata
-    ids = [f"row-{i}" for i in range(len(texts))]
+    texts, metadatas, ids = [], [], []
 
-    # Chuyển metadata thành dict và ép kiểu về string/number/boolean
-    metadatas = df.to_dict(orient="records")
+    for idx, row in df.iterrows():
+        # Bảo đảm có product_id
+        product_id = str(row.get("id_product", "")).strip()
+        if not product_id:
+            product_id = f"prod_{uuid.uuid4().hex[:8]}"
 
-    # Đảm bảo tất cả metadata đều hợp lệ (convert None → "")
-    clean_metadatas = []
-    for record in metadatas:
-        clean_record = {}
-        for k, v in record.items():
-            if v is None:
-                clean_record[k] = ""  # thay None bằng chuỗi
-            elif isinstance(v, (str, int, float, bool)):
-                clean_record[k] = v
-            else:
-                clean_record[k] = str(v)  # ép kiểu về string
-        clean_metadatas.append(clean_record)
+        # Nội dung để embed
+        text_to_embed = (
+            f"Tên sản phẩm: {str(row.get('name', '')).strip()}\n"
+            f"Hãng: {str(row.get('brand', '')).strip()}\n"
+            f"Giá gốc: {str(row.get('price', '')).strip()}\n"
+            f"Khuyến mãi: {str(row.get('coupon', '')).strip()}\n"
+            f"Giá chưa giảm: {str(row.get('price_old', '')).strip()}\n"
+            f"Mô tả chi tiết: {str(row.get('detail_description', '')).strip()}"
+        )
 
-    # Lưu vào Pinecone
-    vectorstore.add_texts(texts, metadatas=clean_metadatas, ids=ids)
+        # Chunk mô tả
+        chunks = text_splitter.split_text(text_to_embed)
 
-    return {"status": "success", "rows_indexed": len(texts)}
+        for i, chunk in enumerate(chunks):
+            texts.append(chunk)
+            ids.append(f"{product_id}_{i}")  # ID duy nhất
+
+            meta = {
+                "id_product": product_id,
+                "chunk_id": str(i),
+                "name": str(row.get("name", "")).strip(),
+                "brand": str(row.get("brand", "")).strip(),
+                "price": str(row.get("price", "")).strip(),
+                "coupon": str(row.get("coupon", "")).strip(),
+                "price_old": str(row.get("price_old", "")).strip(),
+            }
+            metadatas.append(meta)
+
+    # Lưu vào Pinecone bằng upsert (tránh lỗi trùng ID)
+    try:
+        vectorstore.add_texts(
+            texts=texts,
+            metadatas=metadatas,
+            ids=ids
+        )
+    except Exception as e:
+        return {"error": f"Lỗi lưu vào Pinecone: {str(e)}"}
+
+    return {
+        "status": "success",
+        "products_indexed": len(df),
+        "chunks_indexed": len(texts)
+    }
+
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "truy cap /docs"
+    }
+
